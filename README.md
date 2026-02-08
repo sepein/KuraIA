@@ -229,6 +229,21 @@ Ejecuta pruebas unitarias:
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+## Flujo Git local (sin proteccion en GitHub)
+
+Configura hook local para bloquear push si rompe compilacion/tests:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Scripts de apoyo:
+- `scripts/sync-develop.ps1`
+- `scripts/new-feature.ps1 "nombre-cambio"`
+
+Guia completa:
+- `documentos/flujo_git_local.md`
+
 Cobertura actual:
 - parseo de variables de entorno (`_env_int`, `_env_float`, `_env_bool`)
 - lectura de `AppConfig` desde entorno en tiempo de instanciacion

@@ -1,4 +1,6 @@
 ﻿import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -6,6 +8,7 @@ from fastapi.testclient import TestClient
 
 import api_server
 from api_server import _clean_rules, _compose_participant_prompt, _resolve_profile, app
+from debate_memory import SQLiteDebateMemoryStore
 from team_orchestrator_v2 import AppConfig, OpenCodeTeam
 
 
@@ -55,24 +58,17 @@ class ApiServerUtilsTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
 
 
-class _DummyThread:
-    started_count = 0
-
-    def __init__(self, target=None, args=None, daemon=None):
-        self.target = target
-        self.args = args or ()
-        self.daemon = daemon
-
-    def start(self):
-        _DummyThread.started_count += 1
-
-
 class ApiContractTests(unittest.TestCase):
     def setUp(self):
+        self._tmp = TemporaryDirectory(ignore_cleanup_errors=True)
+        api_server._memory_store = SQLiteDebateMemoryStore(str(Path(self._tmp.name) / "memory.db"))
         self.client = TestClient(app)
         with api_server._runtime_lock:
             api_server._runtime_debates.clear()
-        _DummyThread.started_count = 0
+
+    def tearDown(self):
+        self.client.close()
+        self._tmp.cleanup()
 
     def test_create_debate_requires_roles(self):
         response = self.client.post("/debates", json={"task": "Debate sin roles", "roles": []})
@@ -120,8 +116,8 @@ class ApiContractTests(unittest.TestCase):
         self.assertIn("items", body)
         self.assertGreaterEqual(body["count"], 1)
 
-    @patch("api_server.threading.Thread", _DummyThread)
-    def test_create_debate_success_queues_runtime(self):
+    @patch("api_server._run_debate_worker", return_value=None)
+    def test_create_debate_success_queues_runtime(self, _mock_worker):
         payload = {
             "task": "Debate API",
             "discussion_profile": "equipo_programacion",
@@ -134,15 +130,32 @@ class ApiContractTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["status"], "queued")
         self.assertTrue(body["debate_id"].startswith("debate-"))
-        self.assertEqual(_DummyThread.started_count, 1)
 
         with api_server._runtime_lock:
             runtime = api_server._runtime_debates.get(body["debate_id"])
         self.assertIsNotNone(runtime)
         self.assertEqual(runtime.status, "queued")
 
-    @patch("api_server.threading.Thread", _DummyThread)
-    def test_get_debate_returns_runtime_when_no_events(self):
+    @patch("api_server._run_debate_worker", return_value=None)
+    def test_create_debate_persists_memory(self, _mock_worker):
+        payload = {
+            "task": "Debate con memoria",
+            "roles": [{"name": "Arquitecto"}],
+            "sequence": ["Arquitecto"],
+            "parallel_groups": [],
+        }
+        created = self.client.post("/debates", json=payload).json()
+        debate_id = created["debate_id"]
+
+        memory = self.client.get(f"/debates/{debate_id}/memory")
+        self.assertEqual(memory.status_code, 200)
+        memory_payload = memory.json().get("memory", {})
+        self.assertEqual(memory_payload.get("debate_id"), debate_id)
+        self.assertEqual(memory_payload.get("status"), "queued")
+        self.assertEqual(memory_payload.get("task"), "Debate con memoria")
+
+    @patch("api_server._run_debate_worker", return_value=None)
+    def test_get_debate_returns_runtime_when_no_events(self, _mock_worker):
         payload = {
             "task": "Debate API",
             "roles": [{"name": "Arquitecto"}],
@@ -158,8 +171,8 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(body["debate_id"], debate_id)
         self.assertEqual(body["status"], "queued")
 
-    @patch("api_server.threading.Thread", _DummyThread)
-    def test_list_debates_includes_created_item(self):
+    @patch("api_server._run_debate_worker", return_value=None)
+    def test_list_debates_includes_created_item(self, _mock_worker):
         payload = {
             "task": "Debate API",
             "roles": [{"name": "Arquitecto"}],
@@ -173,6 +186,88 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         items = response.json().get("items", [])
         self.assertTrue(any(item.get("debate_id") == debate_id for item in items))
+
+    def test_import_snapshot_then_read_debate_and_events(self):
+        snapshot = {
+            "schema_version": "1.0",
+            "debate": {
+                "debate_id": "debate-import-1",
+                "status": "completed",
+                "reason": "",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "started_at": "2026-01-01T00:00:01+00:00",
+                "finished_at": "2026-01-01T00:00:20+00:00",
+                "rounds": 1,
+                "cost_eur": 0.01,
+                "error": "",
+                "task": "Debate importado",
+                "discussion_profile": "equipo_programacion",
+                "global_instructions": "",
+                "global_rules": [],
+                "roles": [{"name": "Arquitecto"}],
+                "sequence": ["Arquitecto"],
+                "parallel_groups": [],
+                "final_minutes": "Acta final importada",
+                "summary": {
+                    "status": "completed",
+                    "reason": "",
+                    "started_at": "2026-01-01T00:00:01+00:00",
+                    "finished_at": "2026-01-01T00:00:20+00:00",
+                    "rounds": 1,
+                    "cost_eur": 0.01,
+                },
+            },
+            "events": [
+                {
+                    "ts": "2026-01-01T00:00:01+00:00",
+                    "event": "debate_started",
+                    "debate_id": "debate-import-1",
+                    "task": "Debate importado",
+                },
+                {
+                    "ts": "2026-01-01T00:00:10+00:00",
+                    "event": "round_response",
+                    "debate_id": "debate-import-1",
+                    "round_num": 0,
+                    "role": "Arquitecto",
+                    "response": "Respuesta importada",
+                },
+                {
+                    "ts": "2026-01-01T00:00:20+00:00",
+                    "event": "debate_finished",
+                    "debate_id": "debate-import-1",
+                    "status": "completed",
+                    "reason": "",
+                    "cost_eur": 0.01,
+                },
+            ],
+        }
+
+        imported = self.client.post("/memory/import", json={"snapshot": snapshot, "overwrite": True})
+        self.assertEqual(imported.status_code, 200)
+        self.assertEqual(imported.json().get("status"), "imported")
+
+        debate = self.client.get("/debates/debate-import-1")
+        self.assertEqual(debate.status_code, 200)
+        self.assertEqual(debate.json().get("status"), "completed")
+        self.assertEqual(debate.json().get("rounds"), 1)
+
+        events = self.client.get("/debates/debate-import-1/events")
+        self.assertEqual(events.status_code, 200)
+        self.assertEqual(events.json().get("count"), 3)
+
+        export_single = self.client.get("/debates/debate-import-1/export")
+        self.assertEqual(export_single.status_code, 200)
+        self.assertIn("debate", export_single.json())
+        self.assertEqual(len(export_single.json().get("events", [])), 3)
+
+        export_all = self.client.get("/memory/export?limit=10&include_events=true")
+        self.assertEqual(export_all.status_code, 200)
+        self.assertGreaterEqual(export_all.json().get("count", 0), 1)
+
+    def test_export_debate_memory_not_found(self):
+        response = self.client.get("/debates/debate-inexistente/export")
+        self.assertEqual(response.status_code, 404)
 
     def test_get_debate_not_found(self):
         response = self.client.get("/debates/debate-inexistente")
@@ -200,3 +295,4 @@ class ApiContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

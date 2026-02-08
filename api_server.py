@@ -1,4 +1,5 @@
 ﻿import json
+import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from debate_memory import SQLiteDebateMemoryStore
 from team_orchestrator_v2 import (
     AppConfig,
     OpenCodeTeam,
@@ -16,7 +18,7 @@ from team_orchestrator_v2 import (
 
 app = FastAPI(
     title="OpenCode Team Orchestrator API",
-    version="0.1.0",
+    version="0.2.0",
     description="API generica para debates multi-rol sobre OpenCode.",
 )
 
@@ -49,6 +51,11 @@ class InterventionRequest(BaseModel):
     message: Optional[str] = None
 
 
+class MemoryImportRequest(BaseModel):
+    snapshot: Dict[str, object]
+    overwrite: bool = False
+
+
 @dataclass
 class DebateRuntime:
     debate_id: str
@@ -62,6 +69,7 @@ class DebateRuntime:
 _runtime_lock = threading.Lock()
 _runtime_debates: Dict[str, DebateRuntime] = {}
 _config = AppConfig()
+_memory_store = SQLiteDebateMemoryStore(os.getenv("API_MEMORY_DB_FILE", "api_memory.db"))
 
 
 def _now_iso() -> str:
@@ -193,6 +201,66 @@ def _compose_participant_prompt(
     return "\n".join(sections).strip()
 
 
+def _role_to_dict(role: RoleDefinition) -> Dict[str, object]:
+    return {
+        "name": role.name,
+        "model": role.model,
+        "prompt": role.prompt,
+    }
+
+
+def _update_memory_record(debate_id: str, **fields: object) -> None:
+    current = _memory_store.get_debate(debate_id) or {"debate_id": debate_id}
+    current.update(fields)
+    _memory_store.upsert_debate(current)
+
+
+def _build_final_minutes(task: str, summary: Dict[str, object], events: List[Dict]) -> str:
+    lines: List[str] = [
+        "ACTA FINAL DE LA MESA",
+        "",
+        f"Tarea: {task.strip()}",
+        f"Estado: {summary.get('status', '')}",
+        f"Motivo cierre: {summary.get('reason', '')}",
+        f"Rondas con respuesta: {summary.get('rounds', 0)}",
+        f"Coste EUR estimado: {summary.get('cost_eur')}",
+        "",
+        "Puntos clave por turno:",
+    ]
+
+    has_rounds = False
+    for event in events:
+        if event.get("event") != "round_response":
+            continue
+        has_rounds = True
+        role = str(event.get("role", "")).strip() or "rol"
+        response = str(event.get("response", "")).strip()
+        preview = response[:280] + ("..." if len(response) > 280 else "")
+        lines.append(f"- {role}: {preview}")
+
+    if not has_rounds:
+        lines.append("- Sin respuestas registradas.")
+
+    interventions = [
+        item for item in events if item.get("event") == "chief_action" and str(item.get("action", "")).strip()
+    ]
+    lines.append("")
+    lines.append("Intervenciones del conductor:")
+    if not interventions:
+        lines.append("- No hubo intervenciones del conductor.")
+    else:
+        for item in interventions:
+            action = str(item.get("action", "")).strip()
+            feedback = str(item.get("feedback", "")).strip()
+            if feedback:
+                feedback = feedback[:180] + ("..." if len(feedback) > 180 else "")
+                lines.append(f"- {action}: {feedback}")
+            else:
+                lines.append(f"- {action}")
+
+    return "\n".join(lines).strip()
+
+
 def _run_debate_worker(
     debate_id: str,
     request: DebateCreateRequest,
@@ -203,6 +271,12 @@ def _run_debate_worker(
         runtime = _runtime_debates[debate_id]
         runtime.status = "running"
         runtime.started_at = _now_iso()
+
+    _update_memory_record(
+        debate_id,
+        status="running",
+        started_at=runtime.started_at,
+    )
 
     try:
         team = OpenCodeTeam(config=AppConfig())
@@ -238,6 +312,8 @@ def _run_debate_worker(
         )
 
         events = _load_events_for_debate(debate_id)
+        if events:
+            _memory_store.save_events(debate_id, events)
         summary = _summarize_events(events)
 
         with _runtime_lock:
@@ -245,12 +321,32 @@ def _run_debate_worker(
             runtime.status = str(summary.get("status") or "completed")
             runtime.finished_at = _now_iso()
 
+        final_minutes = _build_final_minutes(request.task, summary, events)
+        _update_memory_record(
+            debate_id,
+            status=runtime.status,
+            finished_at=runtime.finished_at,
+            reason=str(summary.get("reason", "")),
+            rounds=int(summary.get("rounds", 0)),
+            cost_eur=summary.get("cost_eur"),
+            summary=summary,
+            final_minutes=final_minutes,
+            error="",
+        )
+
     except Exception as exc:
         with _runtime_lock:
             runtime = _runtime_debates[debate_id]
             runtime.status = "error"
             runtime.error = str(exc)
             runtime.finished_at = _now_iso()
+
+        _update_memory_record(
+            debate_id,
+            status="error",
+            finished_at=runtime.finished_at,
+            error=str(exc),
+        )
 
 
 @app.get("/health")
@@ -292,6 +388,29 @@ def create_debate(request: DebateCreateRequest) -> DebateCreateResponse:
     with _runtime_lock:
         _runtime_debates[debate_id] = runtime
 
+    _memory_store.upsert_debate(
+        {
+            "debate_id": debate_id,
+            "status": "queued",
+            "reason": "",
+            "created_at": runtime.created_at,
+            "started_at": "",
+            "finished_at": "",
+            "rounds": 0,
+            "cost_eur": None,
+            "error": "",
+            "task": request.task,
+            "discussion_profile": request.discussion_profile or "",
+            "global_instructions": request.global_instructions or "",
+            "global_rules": _clean_rules(request.global_rules),
+            "roles": [_role_to_dict(role) for role in roles],
+            "sequence": sequence,
+            "parallel_groups": request.parallel_groups if request.parallel_groups is not None else [],
+            "final_minutes": "",
+            "summary": {},
+        }
+    )
+
     worker = threading.Thread(
         target=_run_debate_worker,
         args=(debate_id, request, roles, sequence),
@@ -307,21 +426,45 @@ def get_debate(debate_id: str) -> Dict[str, object]:
     with _runtime_lock:
         runtime = _runtime_debates.get(debate_id)
 
-    events = _load_events_for_debate(debate_id)
-    if runtime is None and not events:
+    persisted = _memory_store.get_debate(debate_id)
+    events = _memory_store.get_events(debate_id, limit=5000, reverse=False)
+    if not events:
+        events = _load_events_for_debate(debate_id)
+        if events:
+            _memory_store.save_events(debate_id, events)
+
+    if runtime is None and persisted is None and not events:
         raise HTTPException(status_code=404, detail="debate_id no encontrado")
 
-    summary = _summarize_events(events)
+    summary = _summarize_events(events) if events else dict((persisted or {}).get("summary", {}))
+
+    status = runtime.status if runtime else str((persisted or {}).get("status", summary.get("status", "unknown")))
+    reason = str(summary.get("reason", "") or (persisted or {}).get("reason", ""))
+    created_at = runtime.created_at if runtime else str((persisted or {}).get("created_at", ""))
+    started_at = str(
+        summary.get("started_at", "")
+        or (runtime.started_at if runtime else "")
+        or (persisted or {}).get("started_at", "")
+    )
+    finished_at = str(
+        summary.get("finished_at", "")
+        or (runtime.finished_at if runtime else "")
+        or (persisted or {}).get("finished_at", "")
+    )
+    rounds = int(summary.get("rounds", (persisted or {}).get("rounds", 0) or 0))
+    cost_eur = summary.get("cost_eur") if summary.get("cost_eur") is not None else (persisted or {}).get("cost_eur")
+    error = runtime.error if runtime else str((persisted or {}).get("error", ""))
+
     return {
         "debate_id": debate_id,
-        "status": runtime.status if runtime else summary.get("status", "unknown"),
-        "reason": summary.get("reason", ""),
-        "created_at": runtime.created_at if runtime else "",
-        "started_at": summary.get("started_at", "") or (runtime.started_at if runtime else ""),
-        "finished_at": summary.get("finished_at", "") or (runtime.finished_at if runtime else ""),
-        "rounds": summary.get("rounds", 0),
-        "cost_eur": summary.get("cost_eur"),
-        "error": runtime.error if runtime else "",
+        "status": status,
+        "reason": reason,
+        "created_at": created_at,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "rounds": rounds,
+        "cost_eur": cost_eur,
+        "error": error,
     }
 
 
@@ -331,19 +474,65 @@ def get_debate_events(
     limit: int = Query(200, ge=1, le=5000),
     reverse: bool = Query(False),
 ) -> Dict[str, object]:
-    events = _load_events_for_debate(debate_id)
+    events = _memory_store.get_events(debate_id, limit=limit, reverse=reverse)
+    if not events:
+        events = _load_events_for_debate(debate_id)
+        if events:
+            _memory_store.save_events(debate_id, events)
+            events = events[-limit:]
+            if reverse:
+                events = list(reversed(events))
+
     if not events:
         raise HTTPException(status_code=404, detail="No hay eventos para ese debate_id")
 
-    selected = events[-limit:]
-    if reverse:
-        selected = list(reversed(selected))
-
     return {
         "debate_id": debate_id,
-        "count": len(selected),
-        "events": selected,
+        "count": len(events),
+        "events": events,
     }
+
+
+@app.get("/debates/{debate_id}/memory")
+def get_debate_memory(debate_id: str) -> Dict[str, object]:
+    record = _memory_store.get_debate(debate_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="No hay memoria persistida para ese debate_id")
+
+    events_count = len(_memory_store.get_events(debate_id, limit=100_000, reverse=False))
+    return {
+        "debate_id": debate_id,
+        "memory": record,
+        "events_count": events_count,
+    }
+
+
+@app.get("/debates/{debate_id}/export")
+def export_debate_memory(
+    debate_id: str,
+    include_events: bool = Query(True),
+) -> Dict[str, object]:
+    snapshot = _memory_store.export_debate(debate_id, include_events=include_events)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="No hay memoria para exportar en ese debate_id")
+    return snapshot
+
+
+@app.get("/memory/export")
+def export_memory(
+    limit: int = Query(50, ge=1, le=1000),
+    include_events: bool = Query(False),
+) -> Dict[str, object]:
+    return _memory_store.export_many(limit=limit, include_events=include_events)
+
+
+@app.post("/memory/import")
+def import_memory(request: MemoryImportRequest) -> Dict[str, str]:
+    try:
+        result = _memory_store.import_snapshot(request.snapshot, overwrite=request.overwrite)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result
 
 
 @app.post("/debates/{debate_id}/interventions")
@@ -353,9 +542,9 @@ def enqueue_intervention(debate_id: str, request: InterventionRequest) -> Dict[s
 
     with _runtime_lock:
         runtime = _runtime_debates.get(debate_id)
+
     if runtime is None:
-        # Permitimos intervenir debates historicos si existen eventos.
-        if not _load_events_for_debate(debate_id):
+        if _memory_store.get_debate(debate_id) is None and not _load_events_for_debate(debate_id):
             raise HTTPException(status_code=404, detail="debate_id no encontrado")
 
     team = OpenCodeTeam(config=AppConfig())
@@ -371,20 +560,46 @@ def enqueue_intervention(debate_id: str, request: InterventionRequest) -> Dict[s
 
 @app.get("/debates")
 def list_debates(limit: int = Query(50, ge=1, le=500)) -> Dict[str, object]:
+    persisted = _memory_store.list_debates(limit=max(limit * 3, limit))
+    by_id: Dict[str, Dict[str, object]] = {}
+    for item in persisted:
+        debate_id = str(item.get("debate_id", "")).strip()
+        if debate_id:
+            by_id[debate_id] = item
+
     with _runtime_lock:
         runtimes = list(_runtime_debates.values())
 
-    items = sorted(runtimes, key=lambda item: item.created_at, reverse=True)[:limit]
+    for runtime in runtimes:
+        existing = by_id.get(runtime.debate_id, {"debate_id": runtime.debate_id})
+        existing.update(
+            {
+                "debate_id": runtime.debate_id,
+                "status": runtime.status,
+                "created_at": runtime.created_at,
+                "started_at": runtime.started_at,
+                "finished_at": runtime.finished_at,
+                "error": runtime.error,
+            }
+        )
+        by_id[runtime.debate_id] = existing
+
+    items = sorted(
+        by_id.values(),
+        key=lambda item: str(item.get("created_at", "")),
+        reverse=True,
+    )[:limit]
+
     return {
         "count": len(items),
         "items": [
             {
-                "debate_id": item.debate_id,
-                "status": item.status,
-                "created_at": item.created_at,
-                "started_at": item.started_at,
-                "finished_at": item.finished_at,
-                "error": item.error,
+                "debate_id": str(item.get("debate_id", "")),
+                "status": str(item.get("status", "unknown")),
+                "created_at": item.get("created_at", ""),
+                "started_at": item.get("started_at", ""),
+                "finished_at": item.get("finished_at", ""),
+                "error": item.get("error", ""),
             }
             for item in items
         ],

@@ -24,8 +24,9 @@ jobs:
 
       - name: Compile
         run: |
-          python -m py_compile team_orchestrator_v2.py api_server.py dashboard.py orchestrator_cli.py telegram_adapter.py
+          python -m py_compile team_orchestrator_v2.py api_server.py dashboard.py orchestrator_cli.py telegram_adapter.py debate_memory.py
 
       - name: Run tests
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
+

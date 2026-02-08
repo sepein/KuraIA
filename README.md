@@ -63,7 +63,10 @@ Endpoints principales:
 - `GET /debates/{debate_id}/events`
 - `POST /debates/{debate_id}/interventions`
 - `GET /debates`
-- `GET /discussion-profiles`
+- `GET /debates/{debate_id}/memory`
+- `GET /debates/{debate_id}/export`
+- `GET /memory/export`
+- `POST /memory/import`
 
 Nota API general:
 - `roles` es obligatorio en `POST /debates`.
@@ -96,6 +99,34 @@ Ejemplo de creacion:
   "parallel_groups": []
 }
 ```
+
+
+## Memoria persistente (actas + logs)
+
+La API ahora guarda memoria propia en SQLite para no depender solo del JSONL en disco:
+- Metadatos del debate (estado, tarea, perfil, roles, secuencia, coste, error).
+- Eventos del debate para consulta historica.
+- Acta final resumida (`final_minutes`) al cerrar la ejecucion.
+
+Exportacion e importacion:
+- `GET /debates/{debate_id}/export?include_events=true`: exporta snapshot JSON de una mesa.
+- `GET /memory/export?limit=50&include_events=false`: exporta varias memorias.
+- `POST /memory/import`: importa snapshot previamente exportado.
+
+Ejemplo import:
+
+```json
+{
+  "snapshot": {
+    "schema_version": "1.0",
+    "debate": { "debate_id": "debate-123", "status": "completed" },
+    "events": []
+  },
+  "overwrite": false
+}
+```
+
+
 
 ## CLI (Typer)
 
@@ -174,6 +205,7 @@ Puedes ajustar comportamiento sin tocar codigo:
 - `MAX_LOG_TEXT_CHARS` (default: `4000`)
 - `INTERVENTIONS_FILE` (default: `interventions_queue.jsonl`)
 - `ROLE_PROMPTS_FILE` (default: `roles.yaml`)
+- `API_MEMORY_DB_FILE` (default: `api_memory.db`)
 
 Ejemplo en PowerShell:
 
@@ -273,3 +305,7 @@ Cobertura actual:
 - `README.md`: guia de uso.
 - `documentos/mejora-01-intervencion-humana-dinamica.md`: detalle de mejora 01.
 - `documentos/mejora-02-debate-paralelo-con-threading.md`: detalle de mejora 02.
+
+
+
+

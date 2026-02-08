@@ -49,12 +49,23 @@ class SQLiteDebateMemoryStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS output_events (
+                    debate_id TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    PRIMARY KEY (debate_id, idx)
+                )
+                """
+            )
             conn.commit()
 
     def clear_all(self) -> None:
         with self._lock:
             with self._connect() as conn:
                 conn.execute("DELETE FROM debate_events")
+                conn.execute("DELETE FROM output_events")
                 conn.execute("DELETE FROM debates")
                 conn.commit()
 
@@ -148,7 +159,49 @@ class SQLiteDebateMemoryStore:
             selected = list(reversed(selected))
         return selected
 
-    def export_debate(self, debate_id: str, include_events: bool = True) -> Optional[Dict[str, object]]:
+    def save_output_events(self, debate_id: str, events: List[Dict[str, object]]) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM output_events WHERE debate_id = ?", (debate_id,))
+                for idx, event in enumerate(events):
+                    event_json = json.dumps(event, ensure_ascii=False)
+                    conn.execute(
+                        """
+                        INSERT INTO output_events (debate_id, idx, event_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (debate_id, idx, event_json),
+                    )
+                conn.commit()
+
+    def get_output_events(self, debate_id: str, limit: int = 5000, reverse: bool = False) -> List[Dict[str, object]]:
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT event_json FROM output_events WHERE debate_id = ? ORDER BY idx ASC",
+                    (debate_id,),
+                ).fetchall()
+
+        events: List[Dict[str, object]] = []
+        for row in rows:
+            try:
+                event = json.loads(str(row["event_json"]))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+
+        selected = events[-limit:]
+        if reverse:
+            selected = list(reversed(selected))
+        return selected
+
+    def export_debate(
+        self,
+        debate_id: str,
+        include_events: bool = True,
+        include_output_events: bool = True,
+    ) -> Optional[Dict[str, object]]:
         debate = self.get_debate(debate_id)
         if not debate:
             return None
@@ -160,9 +213,16 @@ class SQLiteDebateMemoryStore:
         }
         if include_events:
             payload["events"] = self.get_events(debate_id, limit=100_000, reverse=False)
+        if include_output_events:
+            payload["output_events"] = self.get_output_events(debate_id, limit=100_000, reverse=False)
         return payload
 
-    def export_many(self, limit: int = 50, include_events: bool = False) -> Dict[str, object]:
+    def export_many(
+        self,
+        limit: int = 50,
+        include_events: bool = False,
+        include_output_events: bool = False,
+    ) -> Dict[str, object]:
         debates = self.list_debates(limit=limit)
         snapshots: List[Dict[str, object]] = []
         for debate in debates:
@@ -176,6 +236,8 @@ class SQLiteDebateMemoryStore:
             }
             if include_events:
                 snapshot["events"] = self.get_events(debate_id, limit=100_000, reverse=False)
+            if include_output_events:
+                snapshot["output_events"] = self.get_output_events(debate_id, limit=100_000, reverse=False)
             snapshots.append(snapshot)
 
         return {
@@ -208,7 +270,16 @@ class SQLiteDebateMemoryStore:
                 if isinstance(item, dict):
                     events.append(item)
 
+        output_events_raw = snapshot.get("output_events", [])
+        output_events: List[Dict[str, object]] = []
+        if isinstance(output_events_raw, list):
+            for item in output_events_raw:
+                if isinstance(item, dict):
+                    output_events.append(item)
+
         self.upsert_debate(debate)
         if events:
             self.save_events(debate_id, events)
+        if output_events:
+            self.save_output_events(debate_id, output_events)
         return {"debate_id": debate_id, "status": "imported"}

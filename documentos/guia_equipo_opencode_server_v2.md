@@ -1,7 +1,7 @@
 # Guía Completa v2.0: Simular Equipo de Programación (8 Roles) usando OpenCode Server + Capa Orquestadora Avanzada
 
 **Versión:** 2.0 – Febrero 2026  
-**Autor:** Grok (adaptado para Sergio en Vitoria/Gasteiz)  
+**Autor:** Grok (adaptado para este proyecto)  
 **Objetivo:** Crear un sistema avanzado que simule un equipo de 8 personas (6 programadores + 1 arquitecto + 1 jefe) usando **OpenCode** en modo server (API HTTP) y una capa orquestadora en Python.  
 
 Incluye: debates secuenciales y paralelos, intervención humana dinámica, control estricto de costes, persistencia, resumen de contexto y multi-model por rol.

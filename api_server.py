@@ -1,13 +1,16 @@
-﻿import json
+import json
 import os
 import threading
+import hashlib
+import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from debate_memory import SQLiteDebateMemoryStore
@@ -18,8 +21,11 @@ from team_orchestrator_v2 import (
 
 app = FastAPI(
     title="OpenCode Team Orchestrator API",
-    version="0.2.0",
+    version="0.3.0",
     description="API generica para debates multi-rol sobre OpenCode.",
+    docs_url="/swagger",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
 
@@ -37,6 +43,7 @@ class DebateCreateRequest(BaseModel):
     discussion_profile: Optional[str] = None
     global_instructions: Optional[str] = None
     global_rules: List[str] = Field(default_factory=list)
+    minutes_mode: Literal["programmatic", "agent", "auto"] = "auto"
     bootstrap: bool = True
     check_queued_interventions: bool = True
 
@@ -70,6 +77,32 @@ _runtime_lock = threading.Lock()
 _runtime_debates: Dict[str, DebateRuntime] = {}
 _config = AppConfig()
 _memory_store = SQLiteDebateMemoryStore(os.getenv("API_MEMORY_DB_FILE", "api_memory.db"))
+_minutes_role_name = os.getenv("MINUTES_ROLE_NAME", "Secretario_Actas")
+_default_minutes_role_prompt = (
+    "Eres Secretario_Actas. Tu trabajo es redactar actas ejecutivas cortas y precisas. "
+    "No uses estilo literario ni frases largas. "
+    "Resalta decisiones, desacuerdos relevantes, riesgos y acciones concretas con responsable. "
+    "No inventes datos y marca incertidumbre cuando falte informacion."
+)
+_output_events_enabled = str(os.getenv("OUTPUT_EVENTS_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+_default_output_roles = f"{_config.chief_role_name},{_minutes_role_name}"
+_output_events_allowed_roles = {
+    role.strip()
+    for role in (os.getenv("OUTPUT_EVENTS_ALLOWED_ROLES", _default_output_roles)).split(",")
+    if role.strip()
+}
+_task_tag = "#tarea"
+
+
+@app.get("/docs", include_in_schema=False)
+def docs_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/swagger")
 
 
 def _now_iso() -> str:
@@ -261,6 +294,313 @@ def _build_final_minutes(task: str, summary: Dict[str, object], events: List[Dic
     return "\n".join(lines).strip()
 
 
+def _build_minutes_context(task: str, summary: Dict[str, object], events: List[Dict]) -> str:
+    lines: List[str] = [
+        f"TAREA: {task.strip()}",
+        f"ESTADO: {summary.get('status', '')}",
+        f"MOTIVO_CIERRE: {summary.get('reason', '')}",
+        f"RONDAS: {summary.get('rounds', 0)}",
+        f"COSTE_EUR: {summary.get('cost_eur')}",
+        "",
+        "INTERVENCIONES_RELEVANTES:",
+    ]
+
+    round_events = [event for event in events if event.get("event") == "round_response"]
+    if not round_events:
+        lines.append("- Sin respuestas de participantes.")
+    else:
+        for event in round_events[:20]:
+            role = str(event.get("role", "")).strip() or "rol"
+            response = str(event.get("response", "")).strip()
+            preview = response[:600] + ("..." if len(response) > 600 else "")
+            lines.append(f"- {role}: {preview}")
+
+    chief_events = [
+        event for event in events if event.get("event") == "chief_action" and str(event.get("action", "")).strip()
+    ]
+    lines.append("")
+    lines.append("INTERVENCIONES_CONDUCTOR:")
+    if not chief_events:
+        lines.append("- No hubo intervenciones del conductor.")
+    else:
+        for event in chief_events[:20]:
+            action = str(event.get("action", "")).strip()
+            feedback = str(event.get("feedback", "")).strip()
+            if feedback:
+                feedback = feedback[:300] + ("..." if len(feedback) > 300 else "")
+                lines.append(f"- {action}: {feedback}")
+            else:
+                lines.append(f"- {action}")
+
+    return "\n".join(lines).strip()
+
+
+def _build_final_minutes_with_agent(
+    team: OpenCodeTeam,
+    task: str,
+    summary: Dict[str, object],
+    events: List[Dict],
+) -> str:
+    context = _build_minutes_context(task, summary, events)
+    instruction = (
+        "Redacta un acta ejecutiva breve. "
+        "No escribas en estilo literario. "
+        "Se directo, profesional y concreto.\n\n"
+        "Formato obligatorio:\n"
+        "1) DECISIONES CLAVE (max 5 bullets)\n"
+        "2) PUNTOS DESTACADOS POR PARTICIPANTE (solo lo mas relevante)\n"
+        "3) RIESGOS Y DESACUERDOS (si existen)\n"
+        "4) ACCIONES SIGUIENTES (accion + responsable)\n\n"
+        "Reglas:\n"
+        "- Maximo 900 palabras.\n"
+        "- No inventes nada fuera del contexto.\n"
+        "- Si falta dato, dilo de forma explicita.\n\n"
+        f"CONTEXTO:\n{context}"
+    )
+
+    custom_prompt = None if _minutes_role_name in team.role_prompts else _default_minutes_role_prompt
+    session_id = team.create_agent(_minutes_role_name, custom_prompt=custom_prompt)
+    return team.send_message(session_id, instruction).strip()
+
+
+def _resolve_final_minutes(
+    team: OpenCodeTeam,
+    request: DebateCreateRequest,
+    summary: Dict[str, object],
+    events: List[Dict],
+) -> Tuple[str, str]:
+    programmatic_minutes = _build_final_minutes(request.task, summary, events)
+    mode = request.minutes_mode
+
+    if mode == "programmatic":
+        return programmatic_minutes, "programmatic"
+
+    if mode in ("agent", "auto"):
+        try:
+            agent_minutes = _build_final_minutes_with_agent(team, request.task, summary, events)
+            if agent_minutes:
+                return agent_minutes, "agent"
+        except Exception:
+            if mode == "agent":
+                fallback = (
+                    "ACTA GENERADA EN FALLBACK PROGRAMATICO (fallo al generar por agente).\n\n"
+                    f"{programmatic_minutes}"
+                )
+                return fallback, "programmatic_fallback"
+
+    return programmatic_minutes, "programmatic"
+
+
+def _normalize_task_action(raw_action: str) -> Optional[str]:
+    action = str(raw_action or "").strip().lower()
+    action_map = {
+        "crear": "create",
+        "create": "create",
+        "alta": "create",
+        "nueva": "create",
+        "nuevo": "create",
+        "add": "create",
+        "modificar": "update",
+        "actualizar": "update",
+        "editar": "update",
+        "update": "update",
+        "borrar": "delete",
+        "eliminar": "delete",
+        "delete": "delete",
+        "remove": "delete",
+    }
+    return action_map.get(action)
+
+
+def _parse_task_command(command: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    text = str(command or "").strip()
+    if not text.lower().startswith(_task_tag):
+        return None
+
+    rest = text[len(_task_tag):].strip()
+    if not rest:
+        return None
+
+    action = ""
+    payload: Dict[str, Any] = {}
+    remainder = ""
+    if " " in rest:
+        action, remainder = rest.split(" ", 1)
+        remainder = remainder.strip()
+    else:
+        action = rest.strip()
+
+    normalized_action = _normalize_task_action(action)
+    if not normalized_action:
+        return None
+
+    if remainder.startswith("{") and remainder.endswith("}"):
+        try:
+            loaded = json.loads(remainder)
+        except json.JSONDecodeError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            payload = {str(key): value for key, value in loaded.items()}
+    else:
+        raw_tokens = shlex.split(remainder) if remainder else []
+        free_text_parts: List[str] = []
+        for token in raw_tokens:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key:
+                    payload[key] = value
+            else:
+                free_text_parts.append(token)
+
+        if free_text_parts:
+            if normalized_action == "create" and "title" not in payload and "titulo" not in payload:
+                payload["title"] = " ".join(free_text_parts).strip()
+            else:
+                payload["text"] = " ".join(free_text_parts).strip()
+
+    if not payload and normalized_action == "create":
+        payload["title"] = ""
+
+    return normalized_action, payload
+
+
+def _extract_task_commands_from_text(text: str) -> List[str]:
+    commands: List[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pos = line.lower().find(_task_tag)
+        if pos < 0:
+            continue
+        commands.append(line[pos:].strip())
+    return commands
+
+
+def _output_event_key(
+    debate_id: str,
+    source_event: str,
+    source_role: str,
+    source_ts: str,
+    command: str,
+) -> str:
+    base = "|".join(
+        [
+            str(debate_id).strip(),
+            str(source_event).strip(),
+            str(source_role).strip(),
+            str(source_ts).strip(),
+            str(command).strip(),
+        ]
+    )
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def _build_output_events_for_debate(
+    debate_id: str,
+    events: List[Dict[str, object]],
+    final_minutes: str = "",
+) -> List[Dict[str, object]]:
+    if not _output_events_enabled:
+        return []
+
+    candidates: List[Dict[str, str]] = []
+    for event in events:
+        event_type = str(event.get("event", "")).strip()
+        source_ts = str(event.get("ts", "")).strip()
+        if event_type == "round_response":
+            candidates.append(
+                {
+                    "source_event": "round_response",
+                    "source_role": str(event.get("role", "")).strip(),
+                    "source_ts": source_ts,
+                    "text": str(event.get("response", "")),
+                }
+            )
+        elif event_type == "chief_action":
+            feedback = str(event.get("feedback", "")).strip()
+            if feedback:
+                candidates.append(
+                    {
+                        "source_event": "chief_action",
+                        "source_role": "conductor",
+                        "source_ts": source_ts,
+                        "text": feedback,
+                    }
+                )
+
+    if final_minutes.strip():
+        candidates.append(
+            {
+                "source_event": "final_minutes",
+                "source_role": _minutes_role_name,
+                "source_ts": _now_iso(),
+                "text": final_minutes,
+            }
+        )
+
+    output_events: List[Dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for candidate in candidates:
+        source_role = str(candidate.get("source_role", "")).strip()
+        if _output_events_allowed_roles and source_role not in _output_events_allowed_roles:
+            continue
+
+        text = str(candidate.get("text", ""))
+        for command in _extract_task_commands_from_text(text):
+            parsed = _parse_task_command(command)
+            if parsed is None:
+                continue
+            action, payload = parsed
+            event_key = _output_event_key(
+                debate_id=debate_id,
+                source_event=str(candidate.get("source_event", "")),
+                source_role=source_role,
+                source_ts=str(candidate.get("source_ts", "")),
+                command=command,
+            )
+            if event_key in seen_keys:
+                continue
+            seen_keys.add(event_key)
+
+            output_events.append(
+                {
+                    "output_event_id": f"oe-{uuid4().hex}",
+                    "debate_id": debate_id,
+                    "ts": _now_iso(),
+                    "type": "task_command",
+                    "entity": "task",
+                    "action": action,
+                    "payload": payload,
+                    "trigger": _task_tag,
+                    "raw_command": command,
+                    "source_event": str(candidate.get("source_event", "")),
+                    "source_role": source_role,
+                    "source_ts": str(candidate.get("source_ts", "")),
+                    "idempotency_key": event_key,
+                }
+            )
+
+    return output_events
+
+
+def _ensure_output_events(
+    debate_id: str,
+    events: List[Dict[str, object]],
+    final_minutes: str,
+) -> List[Dict[str, object]]:
+    existing = _memory_store.get_output_events(debate_id, limit=100_000, reverse=False)
+    if existing:
+        return existing
+
+    generated = _build_output_events_for_debate(debate_id, events, final_minutes=final_minutes)
+    if generated:
+        _memory_store.save_output_events(debate_id, generated)
+    return generated
+
+
 def _run_debate_worker(
     debate_id: str,
     request: DebateCreateRequest,
@@ -321,7 +661,13 @@ def _run_debate_worker(
             runtime.status = str(summary.get("status") or "completed")
             runtime.finished_at = _now_iso()
 
-        final_minutes = _build_final_minutes(request.task, summary, events)
+        final_minutes, final_minutes_source = _resolve_final_minutes(team, request, summary, events)
+        output_events = _build_output_events_for_debate(
+            debate_id=debate_id,
+            events=events,
+            final_minutes=final_minutes,
+        )
+        _memory_store.save_output_events(debate_id, output_events)
         _update_memory_record(
             debate_id,
             status=runtime.status,
@@ -331,6 +677,8 @@ def _run_debate_worker(
             cost_eur=summary.get("cost_eur"),
             summary=summary,
             final_minutes=final_minutes,
+            final_minutes_source=final_minutes_source,
+            output_events_count=len(output_events),
             error="",
         )
 
@@ -406,7 +754,10 @@ def create_debate(request: DebateCreateRequest) -> DebateCreateResponse:
             "roles": [_role_to_dict(role) for role in roles],
             "sequence": sequence,
             "parallel_groups": request.parallel_groups if request.parallel_groups is not None else [],
+            "minutes_mode": request.minutes_mode,
             "final_minutes": "",
+            "final_minutes_source": "pending",
+            "output_events_count": 0,
             "summary": {},
         }
     )
@@ -454,6 +805,7 @@ def get_debate(debate_id: str) -> Dict[str, object]:
     rounds = int(summary.get("rounds", (persisted or {}).get("rounds", 0) or 0))
     cost_eur = summary.get("cost_eur") if summary.get("cost_eur") is not None else (persisted or {}).get("cost_eur")
     error = runtime.error if runtime else str((persisted or {}).get("error", ""))
+    output_events_count = int((persisted or {}).get("output_events_count", 0) or 0)
 
     return {
         "debate_id": debate_id,
@@ -465,6 +817,7 @@ def get_debate(debate_id: str) -> Dict[str, object]:
         "rounds": rounds,
         "cost_eur": cost_eur,
         "error": error,
+        "output_events_count": output_events_count,
     }
 
 
@@ -500,10 +853,19 @@ def get_debate_memory(debate_id: str) -> Dict[str, object]:
         raise HTTPException(status_code=404, detail="No hay memoria persistida para ese debate_id")
 
     events_count = len(_memory_store.get_events(debate_id, limit=100_000, reverse=False))
+    output_events = _ensure_output_events(
+        debate_id=debate_id,
+        events=_memory_store.get_events(debate_id, limit=100_000, reverse=False),
+        final_minutes=str(record.get("final_minutes", "")),
+    )
+    if int(record.get("output_events_count", 0) or 0) != len(output_events):
+        _update_memory_record(debate_id, output_events_count=len(output_events))
+        record = _memory_store.get_debate(debate_id) or record
     return {
         "debate_id": debate_id,
         "memory": record,
         "events_count": events_count,
+        "output_events_count": len(output_events),
     }
 
 
@@ -511,19 +873,59 @@ def get_debate_memory(debate_id: str) -> Dict[str, object]:
 def export_debate_memory(
     debate_id: str,
     include_events: bool = Query(True),
+    include_output_events: bool = Query(True),
 ) -> Dict[str, object]:
-    snapshot = _memory_store.export_debate(debate_id, include_events=include_events)
+    snapshot = _memory_store.export_debate(
+        debate_id,
+        include_events=include_events,
+        include_output_events=include_output_events,
+    )
     if not snapshot:
         raise HTTPException(status_code=404, detail="No hay memoria para exportar en ese debate_id")
     return snapshot
+
+
+@app.get("/debates/{debate_id}/output-events")
+def get_debate_output_events(
+    debate_id: str,
+    limit: int = Query(200, ge=1, le=5000),
+    reverse: bool = Query(False),
+) -> Dict[str, object]:
+    record = _memory_store.get_debate(debate_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="debate_id no encontrado")
+
+    events = _memory_store.get_events(debate_id, limit=100_000, reverse=False)
+    output_events = _ensure_output_events(
+        debate_id=debate_id,
+        events=events,
+        final_minutes=str(record.get("final_minutes", "")),
+    )
+    if int(record.get("output_events_count", 0) or 0) != len(output_events):
+        _update_memory_record(debate_id, output_events_count=len(output_events))
+
+    selected = output_events[-limit:]
+    if reverse:
+        selected = list(reversed(selected))
+
+    return {
+        "debate_id": debate_id,
+        "count": len(selected),
+        "events": selected,
+    }
 
 
 @app.get("/memory/export")
 def export_memory(
     limit: int = Query(50, ge=1, le=1000),
     include_events: bool = Query(False),
+    include_output_events: bool = Query(False),
 ) -> Dict[str, object]:
-    return _memory_store.export_many(limit=limit, include_events=include_events)
+    return _memory_store.export_many(
+        limit=limit,
+        include_events=include_events,
+        include_output_events=include_output_events,
+    )
 
 
 @app.post("/memory/import")
@@ -532,6 +934,15 @@ def import_memory(request: MemoryImportRequest) -> Dict[str, str]:
         result = _memory_store.import_snapshot(request.snapshot, overwrite=request.overwrite)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    debate_id = result.get("debate_id", "")
+    if debate_id and result.get("status") == "imported":
+        record = _memory_store.get_debate(debate_id) or {}
+        output_events = _ensure_output_events(
+            debate_id=debate_id,
+            events=_memory_store.get_events(debate_id, limit=100_000, reverse=False),
+            final_minutes=str(record.get("final_minutes", "")),
+        )
+        _update_memory_record(debate_id, output_events_count=len(output_events))
     return result
 
 
@@ -600,6 +1011,7 @@ def list_debates(limit: int = Query(50, ge=1, le=500)) -> Dict[str, object]:
                 "started_at": item.get("started_at", ""),
                 "finished_at": item.get("finished_at", ""),
                 "error": item.get("error", ""),
+                "output_events_count": int(item.get("output_events_count", 0) or 0),
             }
             for item in items
         ],

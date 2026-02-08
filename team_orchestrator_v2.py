@@ -58,6 +58,7 @@ class AppConfig:
     max_log_text_chars: int = field(default_factory=lambda: _env_int("MAX_LOG_TEXT_CHARS", 4000))
     interventions_file: str = field(default_factory=lambda: os.getenv("INTERVENTIONS_FILE", "interventions_queue.jsonl"))
     role_prompts_file: str = field(default_factory=lambda: os.getenv("ROLE_PROMPTS_FILE", "roles.yaml"))
+    chief_role_name: str = field(default_factory=lambda: os.getenv("CHIEF_ROLE_NAME", "Moderador"))
 
     # Groq llama-3.1-70b-versatile prices per token.
     groq_cost_per_input_token_usd: float = 0.59 / 1_000_000
@@ -468,6 +469,9 @@ class OpenCodeTeam:
         if not current:
             raise ValueError("La tarea inicial no puede estar vacia.")
 
+        chief_role = (self.config.chief_role_name or "Moderador").strip() or "Moderador"
+        chief_role_tag = chief_role.upper().replace("_", " ")
+
         debate_id = debate_id or self._next_debate_id()
         debate_status = "completed"
         stop_reason = ""
@@ -554,7 +558,7 @@ class OpenCodeTeam:
 
             next_context = f"Respuesta de {role}: {response}\nSiguiente turno."
 
-            if role != "Jefe_Sergio":
+            if role != chief_role:
                 if check_queued_interventions:
                     queued = self._pull_queued_interventions(debate_id)
                     for item in queued:
@@ -574,7 +578,7 @@ class OpenCodeTeam:
                             break
                         if queued_message:
                             next_context += (
-                                f"\n\n[JEFE SERGIO INTERVIENE]\n{queued_message}\n[/JEFE SERGIO]\n"
+                                f"\n\n[{chief_role_tag} INTERVIENE]\n{queued_message}\n[/{chief_role_tag}]\n"
                             )
                             print("[+] Feedback en cola aplicado.")
                             self._log_event(
@@ -590,9 +594,11 @@ class OpenCodeTeam:
 
                 if interactive:
                     print("-" * 50)
-                    action = input("Intervenir como Jefe? (Enter=continuar, f=feedback, p=parar): ").strip().lower()
+                    action = input(
+                        f"Intervenir como {chief_role}? (Enter=continuar, f=feedback, p=parar): "
+                    ).strip().lower()
                     if action in ("p", "parar", "stop"):
-                        print("Debate detenido por el Jefe.")
+                        print(f"Debate detenido por {chief_role}.")
                         debate_status = "stopped"
                         stop_reason = "chief_stop"
                         self._log_event(
@@ -608,7 +614,7 @@ class OpenCodeTeam:
                         feedback = input("Tu mensaje/feedback: ").strip()
                         if feedback:
                             next_context += (
-                                f"\n\n[JEFE SERGIO INTERVIENE]\n{feedback}\n[/JEFE SERGIO]\n"
+                                f"\n\n[{chief_role_tag} INTERVIENE]\n{feedback}\n[/{chief_role_tag}]\n"
                             )
                             print("Feedback agregado al flujo.\n")
                             self._log_event(
@@ -714,7 +720,7 @@ DEFAULT_ROLES_SEQUENCE = [
     "DevOps_Dev",
     "Tester_Dev",
     "Security_Dev",
-    "Jefe_Sergio",
+    os.getenv("CHIEF_ROLE_NAME", "Moderador"),
 ]
 
 DEFAULT_PARALLEL_GROUPS = [

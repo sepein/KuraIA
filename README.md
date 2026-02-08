@@ -22,7 +22,7 @@ El proyecto incluye:
 - DevOps_Dev
 - Tester_Dev
 - Security_Dev
-- Jefe_Sergio
+- Moderador
 
 ## Requisitos
 
@@ -43,7 +43,7 @@ python team_orchestrator_v2.py
 Flujo interactivo:
 1. Introduces una tarea inicial.
 2. Cada rol responde en secuencia.
-3. Tras cada respuesta (salvo `Jefe_Sergio`) puedes:
+3. Tras cada respuesta (salvo `Moderador`) puedes:
 - `Enter`: continuar
 - `f`: inyectar feedback como jefe
 - `p`: detener el debate
@@ -57,10 +57,16 @@ Servidor API generico para lanzar debates con definicion externa de roles/modelo
 uvicorn api_server:app --host 0.0.0.0 --port 8000
 ```
 
+Documentacion interactiva:
+- Swagger UI: `http://127.0.0.1:8000/swagger`
+- ReDoc: `http://127.0.0.1:8000/redoc`
+- OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
+
 Endpoints principales:
 - `POST /debates`
 - `GET /debates/{debate_id}`
 - `GET /debates/{debate_id}/events`
+- `GET /debates/{debate_id}/output-events`
 - `POST /debates/{debate_id}/interventions`
 - `GET /debates`
 - `GET /debates/{debate_id}/memory`
@@ -83,6 +89,7 @@ Ejemplo de creacion:
     "No inventar datos",
     "Declarar supuestos"
   ],
+  "minutes_mode": "agent",
   "roles": [
     {
       "name": "Arquitecto",
@@ -107,11 +114,40 @@ La API ahora guarda memoria propia en SQLite para no depender solo del JSONL en 
 - Metadatos del debate (estado, tarea, perfil, roles, secuencia, coste, error).
 - Eventos del debate para consulta historica.
 - Acta final resumida (`final_minutes`) al cerrar la ejecucion.
+- Fuente de acta (`final_minutes_source`): `agent`, `programmatic` o `programmatic_fallback`.
+- Eventos de salida accionables (`output_events`) extraidos por reglas.
+
+Modo de generacion de acta (en `POST /debates`):
+- `minutes_mode: "auto"` (default): intenta por agente y, si falla, usa programatico.
+- `minutes_mode: "agent"`: fuerza generacion por agente (con fallback registrado).
+- `minutes_mode: "programmatic"`: resumen determinista sin llamada extra a LLM.
 
 Exportacion e importacion:
 - `GET /debates/{debate_id}/export?include_events=true`: exporta snapshot JSON de una mesa.
-- `GET /memory/export?limit=50&include_events=false`: exporta varias memorias.
+- `GET /memory/export?limit=50&include_events=false&include_output_events=false`: exporta varias memorias.
 - `POST /memory/import`: importa snapshot previamente exportado.
+
+### Output events por reglas (`#tarea`)
+
+Si una intervencion incluye una linea con `#tarea`, la API genera `output_events` estructurados.
+Por defecto se procesan eventos de `Moderador` y `Secretario_Actas`.
+
+Formato recomendado:
+
+```text
+#tarea crear title="Preparar backlog sprint 1" owner=Backend_Dev priority=alta
+#tarea modificar id=TASK-42 state=in_progress
+#tarea borrar id=TASK-15
+```
+
+Tambien admite JSON:
+
+```text
+#tarea crear {"title":"Preparar backlog sprint 1","owner":"Backend_Dev","priority":"alta"}
+```
+
+Consulta:
+- `GET /debates/{debate_id}/output-events`
 
 Ejemplo import:
 
@@ -205,7 +241,11 @@ Puedes ajustar comportamiento sin tocar codigo:
 - `MAX_LOG_TEXT_CHARS` (default: `4000`)
 - `INTERVENTIONS_FILE` (default: `interventions_queue.jsonl`)
 - `ROLE_PROMPTS_FILE` (default: `roles.yaml`)
+- `CHIEF_ROLE_NAME` (default: `Moderador`)
 - `API_MEMORY_DB_FILE` (default: `api_memory.db`)
+- `MINUTES_ROLE_NAME` (default: `Secretario_Actas`)
+- `OUTPUT_EVENTS_ENABLED` (default: `true`)
+- `OUTPUT_EVENTS_ALLOWED_ROLES` (default: `Moderador,Secretario_Actas`)
 
 Ejemplo en PowerShell:
 
@@ -305,6 +345,7 @@ Cobertura actual:
 - `README.md`: guia de uso.
 - `documentos/mejora-01-intervencion-humana-dinamica.md`: detalle de mejora 01.
 - `documentos/mejora-02-debate-paralelo-con-threading.md`: detalle de mejora 02.
+
 
 
 

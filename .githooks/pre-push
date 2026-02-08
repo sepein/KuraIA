@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+
+set -eu
+
+echo "[pre-push] Running compile checks..."
+python -m py_compile team_orchestrator_v2.py api_server.py dashboard.py orchestrator_cli.py telegram_adapter.py
+
+echo "[pre-push] Running unit tests..."
+python -m unittest discover -s tests -p "test_*.py" -v
+
+echo "[pre-push] OK"
